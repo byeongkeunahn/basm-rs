@@ -1,3 +1,4 @@
+#![feature(clone_to_uninit)]
 #![feature(fn_align)]
 #![feature(maybe_uninit_slice)]
 #![feature(maybe_uninit_array_assume_init)]
