@@ -25,39 +25,27 @@ where
     fn apply(u: &U, t: &V) -> V;
     fn compose(u1: &U, u2: &U) -> U;
     fn id_op() -> U;
-    fn apply_option(u: &Option<U>, t: &Option<V>) -> Option<V> {
-        if let Some(u_op) = u {
-            t.as_ref().map(|v| Self::apply(u_op, v))
-        } else {
-            t.clone()
+
+    fn apply_option(op: &Option<U>, val: &Option<V>) -> Option<V> {
+        match op {
+            Some(u) => val.as_ref().map(|v| Self::apply(u, v)),
+            None => val.clone(),
         }
     }
-    fn clone_value(v: &V) -> V {
-        v.clone()
-    }
-    fn clone_op(u: &U) -> U {
-        u.clone()
-    }
-    fn compose_option(u1: &Option<U>, u2: &Option<U>) -> Option<U> {
-        if let Some(x) = u1 {
-            if let Some(y) = u2 {
-                Some(Self::compose(x, y))
-            } else {
-                u1.clone()
-            }
-        } else {
-            u2.clone()
+
+    fn compose_option(outer: &Option<U>, inner: &Option<U>) -> Option<U> {
+        match (outer, inner) {
+            (Some(u1), Some(u2)) => Some(Self::compose(u1, u2)),
+            (Some(_), None) => outer.clone(),
+            (None, _) => inner.clone(),
         }
     }
-    fn binary_op_option(t1: Option<&V>, t2: Option<&V>) -> Option<V> {
-        if let Some(x) = t1 {
-            if let Some(y) = t2 {
-                Some(Self::binary_op(x, y))
-            } else {
-                t1.cloned()
-            }
-        } else {
-            t2.cloned()
+
+    fn binary_op_option(lhs: Option<&V>, rhs: Option<&V>) -> Option<V> {
+        match (lhs, rhs) {
+            (Some(a), Some(b)) => Some(Self::binary_op(a, b)),
+            (Some(_), None) => lhs.cloned(),
+            (None, _) => rhs.cloned(),
         }
     }
 }
