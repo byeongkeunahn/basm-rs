@@ -832,20 +832,19 @@ where
                 //   3) cur_ptr is not full
                 let mut cur_ptr = &mut self.root;
                 let mut cur_level = self.depth - 1;
-                let mut u = None;
-                core::mem::swap(&mut u, &mut self.lazy);
+                let mut pending_lazy = None;
+                core::mem::swap(&mut pending_lazy, &mut self.lazy);
                 while cur_level > 0 {
-                    let y = cur_ptr.internal_node.as_mut().unwrap().as_mut()
-                        as *mut InternalNode<K, V, U, F>;
-
                     // Push-down the lazy op
-                    let x = cur_ptr.as_internal_node_mut();
-                    x.push(&u);
+                    let node_raw = cur_ptr.internal_node.as_mut().unwrap().as_mut()
+                        as *mut InternalNode<K, V, U, F>;
+                    let node = cur_ptr.as_internal_node_mut();
+                    node.push(&pending_lazy);
 
                     // Find which child to traverse
                     let mut i = 0;
-                    while i + 1 < x.count {
-                        match Ord::cmp(x.keys[i + 1].assume_init_ref(), &key) {
+                    while i + 1 < node.count {
+                        match Ord::cmp(node.keys[i + 1].assume_init_ref(), &key) {
                             Less | Equal => {
                                 i += 1;
                                 continue;
@@ -859,28 +858,28 @@ where
                     }
 
                     // Save lazy op for the node right below the current level
-                    u = x.pop_lazy(i);
+                    pending_lazy = node.pop_lazy(i);
 
                     // Save cur_ptr on stack
-                    stack[stack_size] = MaybeUninit::new((y, i));
+                    stack[stack_size] = MaybeUninit::new((node_raw, i));
                     stack_size += 1;
 
                     // Update cur_level
                     cur_level -= 1;
 
                     // Go to the child node
-                    cur_ptr = &mut x.children[i];
+                    cur_ptr = &mut node.children[i];
                 }
 
                 // Apply lazy op to the leaf node
-                cur_ptr.as_leaf_node_mut().push(&u);
+                cur_ptr.as_leaf_node_mut().push(&pending_lazy);
 
                 // Phase 2:
                 //   Find the duplicate key if it exists,
                 //   and return the existing value by move if found
-                let mut up_ptr = cur_ptr.split_if_full(0);
+                let mut carry = cur_ptr.split_if_full(0);
                 let leaf_node = cur_ptr.as_leaf_node_mut();
-                if let Some(n) = &mut up_ptr {
+                if let Some(n) = &mut carry {
                     let x = n.as_leaf_node_mut();
                     if key.cmp(x.keys[0].assume_init_ref()) == Less {
                         out = leaf_node.insert(key, value);
@@ -902,45 +901,42 @@ where
                         let (ptr, i) = stack[stack_size - 1].assume_init();
                         (&mut *ptr, i)
                     };
-                    if let Some(up_ptr_inner) = up_ptr {
-                        // We need to insert up_ptr in the node n after position i
-                        if let Some(mut right) = n.split_if_full(level) {
+                    stack_size -= 1;
+
+                    if let Some(right_child) = carry.take() {
+                        // We need to insert carry in the node n after position i
+                        if let Some(mut right_node) = n.split_if_full(level) {
                             if i >= T {
                                 // insert to right.1 at i + 1 - T
-                                let r = right.as_internal_node_mut();
-                                r.insert_at(i + 1 - T, up_ptr_inner, level);
+                                let r = right_node.as_internal_node_mut();
+                                r.insert_at(i + 1 - T, right_child, level);
                                 r.pull_at(i - T, level);
                             } else {
                                 // insert to n at i + 1
-                                n.insert_at(i + 1, up_ptr_inner, level);
+                                n.insert_at(i + 1, right_child, level);
                                 n.pull_at(i, level);
                             }
-                            // Update up_ptr
-                            up_ptr = Some(right);
+                            carry = Some(right_node);
                         } else {
-                            n.insert_at(i + 1, up_ptr_inner, level);
-                            up_ptr = None;
+                            n.insert_at(i + 1, right_child, level);
                             n.pull_at(i, level);
                         }
                     } else {
                         n.pull_at(i, level);
                     }
-
-                    // Pop
-                    stack_size -= 1;
                 }
 
                 // Create a new root if needed
-                if let Some(up_ptr_inner) = up_ptr {
-                    let mut root_node: Box<InternalNode<K, V, U, F>> = Box::default();
-                    let mut tmp = ChildPtr {
+                if let Some(right_root) = carry {
+                    let mut new_root: Box<InternalNode<K, V, U, F>> = Box::default();
+                    let mut old_root = ChildPtr {
                         internal_node: ManuallyDrop::new(None),
                     };
-                    core::mem::swap(&mut tmp, &mut self.root);
-                    root_node.insert_at(0, tmp, self.depth);
-                    root_node.insert_at(1, up_ptr_inner, self.depth);
+                    core::mem::swap(&mut old_root, &mut self.root);
+                    new_root.insert_at(0, old_root, self.depth);
+                    new_root.insert_at(1, right_root, self.depth);
                     self.root = ChildPtr {
-                        internal_node: ManuallyDrop::new(Some(root_node)),
+                        internal_node: ManuallyDrop::new(Some(new_root)),
                     };
                     self.depth += 1;
                 }
