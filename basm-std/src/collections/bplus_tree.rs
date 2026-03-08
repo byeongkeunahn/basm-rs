@@ -449,52 +449,43 @@ where
         self.lazy_mask =
             (self.lazy_mask & ((1 << i) - 1)) | ((self.lazy_mask & !((1 << i) - 1)) << 1);
     }
-    fn push(&mut self, u: &Option<U>) {
-        if let Some(u) = u {
-            unsafe {
-                for i in 0..self.count {
-                    if self.lazy_mask & (1 << i) != 0 {
-                        self.lazies[i] =
-                            MaybeUninit::new(F::compose(u, &self.lazies[i].assume_init_read()));
-                    } else {
-                        self.lazies[i] = MaybeUninit::new(u.clone());
-                    }
-                    self.values[i] =
-                        MaybeUninit::new(F::apply(u, &self.values[i].assume_init_read()));
+    fn push(&mut self, op: &Option<U>) {
+        let Some(op) = op else { return };
+        unsafe {
+            for i in 0..self.count {
+                if self.lazy_mask & (1 << i) != 0 {
+                    self.lazies[i] =
+                        MaybeUninit::new(F::compose(op, &self.lazies[i].assume_init_read()));
+                } else {
+                    self.lazies[i] = MaybeUninit::new(op.clone());
                 }
-                self.lazy_mask = (1 << self.count) - 1; // every node gets a lazy
+                self.values[i] = MaybeUninit::new(F::apply(op, &self.values[i].assume_init_read()));
             }
         }
+        self.lazy_mask = (1 << self.count) - 1; // every node gets a lazys
     }
     /// Pulls key and value from `self.children[i]`.
     fn pull_at(&mut self, i: usize, level: usize) {
+        debug_assert!(level >= 1);
         unsafe {
-            debug_assert!(level >= 1);
-            let v = self.children[i].aggregate(level - 1);
-            self.keys[i].assume_init_drop();
-            self.keys[i] = MaybeUninit::new(self.children[i].least_key(level - 1));
-            self.values[i].assume_init_drop();
-            if self.lazy_mask & (1 << i) == 0 {
-                self.values[i] = MaybeUninit::new(v);
-            } else {
-                self.values[i] = MaybeUninit::new(F::apply(self.lazies[i].assume_init_ref(), &v));
+            let child_key = self.children[i].least_key(level - 1);
+            let mut child_val = self.children[i].aggregate(level - 1);
+            if self.lazy_mask & (1 << i) != 0 {
+                child_val = F::apply(self.lazies[i].assume_init_ref(), &child_val);
             }
+            self.keys[i].assume_init_drop();
+            self.keys[i] = MaybeUninit::new(child_key);
+            self.values[i].assume_init_drop();
+            self.values[i] = MaybeUninit::new(child_val);
         }
     }
     /// Returns the aggregate value of the current node.
     fn aggregate(&self) -> V {
-        let values = unsafe { self.values.assume_init_ref() };
-        if self.count == 0 {
-            unreachable!()
-        } else if self.count == 1 {
-            values[0].clone()
-        } else {
-            let mut out = F::binary_op(&values[0], &values[1]);
-            for i in 2..self.count {
-                out = F::binary_op(&out, &values[i]);
-            }
-            out
-        }
+        debug_assert!(self.count > 0, "aggregate called on empty InternalNode");
+        let values = unsafe { self.values[..self.count].assume_init_ref() };
+        values[1..]
+            .iter()
+            .fold(values[0].clone(), |acc, v| F::binary_op(&acc, v))
     }
     /// \[start, end\] only potentially has overlap; outside it, no overlap is guaranteed.
     /// Returns (start, end, sum on start+1..=end-1)
@@ -582,16 +573,14 @@ where
         I: IntoIterator<Item = ChildPtr<K, V, U, F>>,
     {
         assert!(n <= 2 * T);
-        let mut out = Self::default();
-        let mut iter = iter.into_iter();
-        for i in 0..n {
-            let ptr = iter.next().unwrap();
-            out.keys[i] = MaybeUninit::new(ptr.least_key(level - 1));
-            out.values[i] = MaybeUninit::new(ptr.aggregate(level - 1));
-            out.children[i] = ptr;
+        let mut node = Self::default();
+        for (i, child) in iter.into_iter().take(n).enumerate() {
+            node.keys[i] = MaybeUninit::new(child.least_key(level - 1));
+            node.values[i] = MaybeUninit::new(child.aggregate(level - 1));
+            node.children[i] = child;
         }
-        out.count = n;
-        out
+        node.count = n;
+        node
     }
 }
 
@@ -603,31 +592,27 @@ where
     F: LazyOp<V, U>,
 {
     fn split_if_full(&mut self) -> Option<ChildPtr<K, V, U, F>> {
-        if self.count == self.keys.len() {
-            self.count = T;
-            let mut right_node = Box::new(Self {
-                count: T,
-                keys: [const { MaybeUninit::uninit() }; 2 * T],
-                values: [const { MaybeUninit::uninit() }; 2 * T],
-                _u: PhantomData,
-                _f: PhantomData,
-            });
-
-            unsafe {
-                // Move keys
-                self.keys.assume_init_ref()[T..]
-                    .clone_to_uninit(right_node.keys.assume_init_mut().as_mut_ptr() as *mut u8);
-                // Move values
-                self.values.assume_init_ref()[T..]
-                    .clone_to_uninit(right_node.values.assume_init_mut().as_mut_ptr() as *mut u8);
-            }
-
-            Some(ChildPtr {
-                leaf_node: ManuallyDrop::new(Some(right_node)),
-            })
-        } else {
-            None
+        if self.count < self.keys.len() {
+            return None;
         }
+        self.count = T;
+        let mut right = Box::new(Self {
+            count: T,
+            keys: [const { MaybeUninit::uninit() }; 2 * T],
+            values: [const { MaybeUninit::uninit() }; 2 * T],
+            _u: PhantomData,
+            _f: PhantomData,
+        });
+        unsafe {
+            self.keys.assume_init_ref()[T..]
+                .clone_to_uninit(right.keys.assume_init_mut().as_mut_ptr() as *mut u8);
+            self.values.assume_init_ref()[T..]
+                .clone_to_uninit(right.values.assume_init_mut().as_mut_ptr() as *mut u8);
+        }
+
+        Some(ChildPtr {
+            leaf_node: ManuallyDrop::new(Some(right)),
+        })
     }
     fn insert(&mut self, key: K, mut value: V) -> Option<V> {
         for i in 0..self.count {
@@ -668,45 +653,32 @@ where
         }
     }
     fn aggregate(&self) -> V {
-        let values = unsafe { self.values.assume_init_ref() };
-        if self.count == 0 {
-            unreachable!()
-        } else if self.count == 1 {
-            values[0].clone()
-        } else {
-            let mut out = F::binary_op(&values[0], &values[1]);
-            for i in 2..self.count {
-                out = F::binary_op(&out, &values[i]);
-            }
-            out
-        }
+        debug_assert!(self.count > 0, "aggregate called on empty LeafNode");
+        let values = unsafe { self.values[..self.count].assume_init_ref() };
+        values[1..]
+            .iter()
+            .fold(values[0].clone(), |acc, v| F::binary_op(&acc, v))
     }
     /// Returns sum of all values whose keys fall in `range`.
     ///
     /// Note: usize values represent [start, end)
     fn aggregate_range<R: RangeBounds<K>>(&self, range: &R) -> (usize, usize, Option<V>) {
-        let mut start = 0;
-        while start < self.count && !range.contains(unsafe { self.keys[start].assume_init_ref() }) {
-            start += 1;
-        }
-        let mut end = start;
-        while end < self.count && range.contains(unsafe { self.keys[end].assume_init_ref() }) {
-            end += 1;
-        }
-        let mut out = None;
-        if start < end {
-            let values = unsafe { self.values.assume_init_ref() };
-            if start + 1 == end {
-                out = Some(values[start].clone());
-            } else {
-                let mut v = F::binary_op(&values[start], &values[start + 1]);
-                for i in start + 2..end {
-                    v = F::binary_op(&v, &values[i]);
-                }
-                out = Some(v);
-            }
-        }
-        (start, end, out)
+        let start = (0..self.count)
+            .find(|&i| range.contains(unsafe { self.keys[i].assume_init_ref() }))
+            .unwrap_or(self.count);
+        let end = (start..self.count)
+            .take_while(|&i| range.contains(unsafe { self.keys[i].assume_init_ref() }))
+            .last()
+            .map_or(start, |i| i + 1);
+
+        let values = unsafe { self.values[start..end].assume_init_ref() };
+        let agg = values.first().map(|v| {
+            values[1..]
+                .iter()
+                .fold(v.clone(), |acc, vi| F::binary_op(&acc, vi))
+        });
+
+        (start, end, agg)
     }
     /// Applies `op` to `self.values[start..end]` in-place.
     unsafe fn apply_op_range(&mut self, op: &U, start: usize, end: usize) {
