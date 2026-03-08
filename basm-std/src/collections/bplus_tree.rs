@@ -1125,10 +1125,7 @@ where
     }
 }
 
-pub trait Op<V>
-where
-    V: Clone,
-{
+pub trait Op<V: Clone> {
     fn binary_op(t1: &V, t2: &V) -> V;
 }
 
